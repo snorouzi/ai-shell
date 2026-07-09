@@ -18,6 +18,7 @@ import (
 	"ai-shell/internal/config"
 	shellcontext "ai-shell/internal/context"
 	"ai-shell/internal/daemon"
+	"ai-shell/internal/execution"
 )
 
 const sessionEnv = "AI_SHELL_SESSION_ID"
@@ -169,7 +170,7 @@ func sendCommand(conn net.Conn, cfg config.Config, sessionID string, cmd command
 			spinner.Stop()
 		}
 
-		done, err := handleResponse(stdout, resp, spinner)
+		done, err := handleResponse(conn, cfg, sessionID, stdout, resp, spinner)
 		if err != nil {
 			return err
 		}
@@ -205,7 +206,7 @@ func requestForCommand(sessionID string, cmd command) daemon.Request {
 	}
 }
 
-func handleResponse(stdout io.Writer, resp daemon.Response, spinner *thinkingSpinner) (bool, error) {
+func handleResponse(conn net.Conn, cfg config.Config, sessionID string, stdout io.Writer, resp daemon.Response, spinner *thinkingSpinner) (bool, error) {
 	switch resp.Type {
 	case daemon.ResponseChunk:
 		if spinner != nil {
@@ -218,6 +219,8 @@ func handleResponse(stdout io.Writer, resp daemon.Response, spinner *thinkingSpi
 		return true, err
 	case daemon.ResponseError:
 		return true, errors.New(resp.Error)
+	case daemon.ResponseSuggestion:
+		return true, handleSuggestion(conn, cfg, sessionID, stdout, resp)
 	case daemon.ResponseModelSwitch:
 		_, err := fmt.Fprintf(stdout, "current model: %s\n", resp.CurrentModel)
 		return true, err
@@ -229,6 +232,38 @@ func handleResponse(stdout io.Writer, resp daemon.Response, spinner *thinkingSpi
 	default:
 		return true, fmt.Errorf("unknown response type %q", resp.Type)
 	}
+}
+
+// handleSuggestion shows a model-suggested command and, when execution is
+// enabled, asks the user to confirm before sending execute_confirm back to the
+// daemon. With execution disabled it only displays the suggestion.
+func handleSuggestion(conn net.Conn, cfg config.Config, sessionID string, stdout io.Writer, resp daemon.Response) error {
+	if resp.Explanation != "" {
+		fmt.Fprintln(stdout, resp.Explanation)
+	}
+	for i, cmd := range resp.Commands {
+		fmt.Fprintf(stdout, "  %d. %s\n", i+1, cmd)
+	}
+	fmt.Fprintf(stdout, "Risk: %s\n", resp.Risk)
+
+	if !cfg.Execution.Enabled {
+		return nil
+	}
+
+	approved, err := execution.Confirm(os.Stdin, stdout, execution.Suggestion{
+		Explanation: resp.Explanation,
+		Commands:    resp.Commands,
+		Risk:        resp.Risk,
+	}, cfg.Execution)
+	if err != nil {
+		return err
+	}
+
+	return json.NewEncoder(conn).Encode(daemon.Request{
+		Type:      daemon.RequestExecuteConfirm,
+		SessionID: sessionID,
+		Approve:   approved,
+	})
 }
 
 func printModels(stdout io.Writer, resp daemon.Response) error {

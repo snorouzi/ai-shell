@@ -3,6 +3,8 @@ package session
 import (
 	"sync"
 	"time"
+
+	"ai-shell/internal/execution"
 )
 
 type Store struct {
@@ -71,6 +73,38 @@ func (s *Store) Touch(sessionID string) {
 	defer s.mu.Unlock()
 
 	session.LastActivity = time.Now()
+}
+
+// SetPendingSuggestion stores the suggestion awaiting the user's confirmation.
+func (s *Store) SetPendingSuggestion(sessionID string, sug *execution.Suggestion) {
+	session := s.get(sessionID)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	session.PendingSuggestion = sug
+	session.LastActivity = time.Now()
+}
+
+// PendingSuggestion returns the suggestion awaiting confirmation, if any.
+func (s *Store) PendingSuggestion(sessionID string) *execution.Suggestion {
+	session := s.get(sessionID)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return session.PendingSuggestion
+}
+
+// ClearPendingSuggestion drops any stored suggestion (e.g. after it is
+// confirmed or rejected) so it cannot be executed twice.
+func (s *Store) ClearPendingSuggestion(sessionID string) {
+	session := s.get(sessionID)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	session.PendingSuggestion = nil
 }
 
 func (s *Store) get(sessionID string) *Session {

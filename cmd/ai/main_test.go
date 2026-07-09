@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"testing"
 
+	"ai-shell/internal/config"
 	"ai-shell/internal/daemon"
 )
 
@@ -91,7 +92,7 @@ func TestRequestForModelCurrent(t *testing.T) {
 func TestHandleModelListResponse(t *testing.T) {
 	var out bytes.Buffer
 
-	done, err := handleResponse(&out, daemon.Response{
+	done, err := handleResponse(nil, config.Config{}, "", &out, daemon.Response{
 		Type:         daemon.ResponseModelList,
 		CurrentModel: "qwen3:8b",
 		Profiles: []daemon.ModelProfile{
@@ -117,7 +118,7 @@ func TestHandleChunkStopsSpinner(t *testing.T) {
 	spinner := newThinkingSpinner(&stderr)
 	spinner.Start()
 
-	done, err := handleResponse(&stdout, daemon.Response{
+	done, err := handleResponse(nil, config.Config{}, "", &stdout, daemon.Response{
 		Type:    daemon.ResponseChunk,
 		Content: "OK",
 	}, spinner)

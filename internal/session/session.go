@@ -2,6 +2,8 @@ package session
 
 import (
 	"time"
+
+	"ai-shell/internal/execution"
 )
 
 type Message struct {
@@ -10,7 +12,8 @@ type Message struct {
 }
 
 type Session struct {
-	Messages     []Message
-	CurrentModel string
-	LastActivity time.Time
+	Messages          []Message
+	CurrentModel      string
+	LastActivity      time.Time
+	PendingSuggestion *execution.Suggestion
 }

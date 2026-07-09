@@ -3,10 +3,11 @@ package daemon
 import shellcontext "ai-shell/internal/context"
 
 const (
-	RequestQuery        = "query"
-	RequestModelSwitch  = "model_switch"
-	RequestModelCurrent = "model_current"
-	RequestModelList    = "model_list"
+	RequestQuery         = "query"
+	RequestModelSwitch   = "model_switch"
+	RequestModelCurrent  = "model_current"
+	RequestModelList     = "model_list"
+	RequestExecuteConfirm = "execute_confirm"
 
 	ResponseChunk       = "chunk"
 	ResponseDone        = "done"
@@ -14,6 +15,7 @@ const (
 	ResponseModel       = "model"
 	ResponseModelList   = "model_list"
 	ResponseModelSwitch = "model_switch"
+	ResponseSuggestion  = "suggestion"
 )
 
 type Request struct {
@@ -22,6 +24,7 @@ type Request struct {
 	Prompt    string `json:"prompt,omitempty"`
 	Model     string `json:"model,omitempty"`
 	Reset     bool   `json:"reset,omitempty"`
+	Approve   bool   `json:"approve,omitempty"`
 	Context   shellcontext.Payload `json:"context,omitempty"`
 }
 
@@ -32,6 +35,9 @@ type Response struct {
 	CurrentModel string         `json:"current_model,omitempty"`
 	DefaultModel string         `json:"default_model,omitempty"`
 	Profiles     []ModelProfile `json:"profiles,omitempty"`
+	Explanation  string         `json:"explanation,omitempty"`
+	Commands     []string       `json:"commands,omitempty"`
+	Risk         string         `json:"risk,omitempty"`
 }
 
 type ModelProfile struct {

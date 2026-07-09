@@ -16,6 +16,7 @@ import (
 
 	"ai-shell/internal/config"
 	shellcontext "ai-shell/internal/context"
+	"ai-shell/internal/execution"
 	"ai-shell/internal/ollama"
 	"ai-shell/internal/preflight"
 	"ai-shell/internal/session"
@@ -122,6 +123,8 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		s.handleModelCurrent(conn, req)
 	case RequestModelList:
 		s.handleModelList(ctx, conn, req)
+	case RequestExecuteConfirm:
+		s.handleExecuteConfirm(ctx, conn, req)
 	default:
 		writeResponse(conn, Response{Type: ResponseError, Error: fmt.Sprintf("unknown request type %q", req.Type)})
 	}
@@ -131,6 +134,11 @@ func (s *Server) handleQuery(ctx context.Context, w io.Writer, req Request) {
 	model, err := s.modelForQuery(req.SessionID, req.Model)
 	if err != nil {
 		writeResponse(w, Response{Type: ResponseError, Error: err.Error()})
+		return
+	}
+
+	if s.cfg.Execution.Enabled {
+		s.handleExecQuery(ctx, w, req, model)
 		return
 	}
 
@@ -159,6 +167,97 @@ func (s *Server) handleQuery(ctx context.Context, w io.Writer, req Request) {
 		session.Message{Role: "assistant", Content: assistant.String()},
 	)
 	writeResponse(w, Response{Type: ResponseDone})
+}
+
+// handleExecQuery asks the model for a structured command suggestion (JSON),
+// classifies its risk from the config rules, and returns it as a suggestion the
+// client can confirm. Plain-text or command-less answers fall back to a normal
+// response so execution never breaks ordinary chat.
+func (s *Server) handleExecQuery(ctx context.Context, w io.Writer, req Request, model string) {
+	requestContext := shellcontext.Enrich(ctx, s.cfg.Context, req.Context)
+	system := shellcontext.SystemPrompt(s.cfg.Context, requestContext)
+	if system != "" {
+		system += "\n\n"
+	}
+	system += execution.SystemPrompt()
+
+	var raw strings.Builder
+	err := s.ollama.Generate(ctx, ollama.GenerateRequest{
+		Model:  model,
+		Prompt: s.promptWithHistory(req.SessionID, req.Prompt),
+		System: system,
+	}, func(chunk ollama.GenerateChunk) error {
+		raw.WriteString(chunk.Response)
+		return nil
+	})
+	if err != nil {
+		writeResponse(w, Response{Type: ResponseError, Error: err.Error()})
+		return
+	}
+
+	sug, perr := parseSuggestion(raw.String())
+	if perr != nil {
+		// Could not parse JSON: echo the model's raw text as a normal answer.
+		writeResponse(w, Response{Type: ResponseChunk, Content: raw.String()})
+		writeResponse(w, Response{Type: ResponseDone})
+		return
+	}
+	if len(sug.Commands) == 0 {
+		// Valid JSON but no command: treat the explanation as a normal answer.
+		writeResponse(w, Response{Type: ResponseChunk, Content: sug.Explanation})
+		writeResponse(w, Response{Type: ResponseDone})
+		return
+	}
+
+	sug.Risk = execution.Classify(sug.Commands, sug.Risk, s.cfg.Execution.RiskRules)
+	s.sessions.SetPendingSuggestion(req.SessionID, &sug)
+
+	writeResponse(w, Response{
+		Type:        ResponseSuggestion,
+		Explanation: sug.Explanation,
+		Commands:    sug.Commands,
+		Risk:        sug.Risk,
+	})
+}
+
+// handleExecuteConfirm runs the pending suggestion once the client confirms.
+// Confirmation and execution are gated on execution.enabled, and the pending
+// suggestion is cleared so it can never be run a second time.
+func (s *Server) handleExecuteConfirm(ctx context.Context, w io.Writer, req Request) {
+	sug := s.sessions.PendingSuggestion(req.SessionID)
+	s.sessions.ClearPendingSuggestion(req.SessionID)
+
+	if sug == nil {
+		writeResponse(w, Response{Type: ResponseError, Error: "no pending suggestion to confirm"})
+		return
+	}
+	if !req.Approve || !s.cfg.Execution.Enabled {
+		writeResponse(w, Response{Type: ResponseDone})
+		return
+	}
+
+	var b strings.Builder
+	for _, cmd := range sug.Commands {
+		out, err := execution.Execute(ctx, cmd, sug.Risk, s.cfg.Execution)
+		fmt.Fprintf(&b, "$ %s\n%s", cmd, out)
+		if err != nil {
+			fmt.Fprintf(&b, "error: %v\n", err)
+		}
+	}
+	writeResponse(w, Response{Type: ResponseChunk, Content: b.String()})
+	writeResponse(w, Response{Type: ResponseDone})
+}
+
+func parseSuggestion(raw string) (execution.Suggestion, error) {
+	trimmed := strings.TrimSpace(raw)
+	if start, end := strings.Index(trimmed, "{"), strings.LastIndex(trimmed, "}"); start >= 0 && end > start {
+		trimmed = trimmed[start : end+1]
+	}
+	var sug execution.Suggestion
+	if err := json.Unmarshal([]byte(trimmed), &sug); err != nil {
+		return sug, err
+	}
+	return sug, nil
 }
 
 func (s *Server) handleModelSwitch(ctx context.Context, w io.Writer, req Request) {
