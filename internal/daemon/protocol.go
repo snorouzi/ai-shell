@@ -1,5 +1,7 @@
 package daemon
 
+import shellcontext "ai-shell/internal/context"
+
 const (
 	RequestQuery        = "query"
 	RequestModelSwitch  = "model_switch"
@@ -20,6 +22,7 @@ type Request struct {
 	Prompt    string `json:"prompt,omitempty"`
 	Model     string `json:"model,omitempty"`
 	Reset     bool   `json:"reset,omitempty"`
+	Context   shellcontext.Payload `json:"context,omitempty"`
 }
 
 type Response struct {

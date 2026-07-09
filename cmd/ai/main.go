@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"ai-shell/internal/config"
+	shellcontext "ai-shell/internal/context"
 	"ai-shell/internal/daemon"
 )
 
@@ -60,7 +61,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 	}
 	defer conn.Close()
 
-	return sendCommand(conn, sessionID(), cmd, stdout, stderr)
+	return sendCommand(conn, cfg, sessionID(), cmd, stdout, stderr)
 }
 
 func parseArgs(args []string, stderr io.Writer) (command, error) {
@@ -138,8 +139,11 @@ func ensureDaemon(cfg config.Config, stderr io.Writer) error {
 	return fmt.Errorf("daemon did not become ready at %s", cfg.Daemon.SocketPath)
 }
 
-func sendCommand(conn net.Conn, sessionID string, cmd command, stdout, stderr io.Writer) error {
+func sendCommand(conn net.Conn, cfg config.Config, sessionID string, cmd command, stdout, stderr io.Writer) error {
 	req := requestForCommand(sessionID, cmd)
+	if cmd.kind == "query" {
+		req.Context = shellcontext.GatherClient(cfg.Context)
+	}
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		return err
 	}

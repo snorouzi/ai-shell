@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"ai-shell/internal/config"
+	shellcontext "ai-shell/internal/context"
 	"ai-shell/internal/ollama"
 	"ai-shell/internal/session"
 )
@@ -127,11 +128,14 @@ func (s *Server) handleQuery(ctx context.Context, w io.Writer, req Request) {
 		return
 	}
 
+	requestContext := shellcontext.Enrich(ctx, s.cfg.Context, req.Context)
+	systemPrompt := shellcontext.SystemPrompt(s.cfg.Context, requestContext)
 	prompt := s.promptWithHistory(req.SessionID, req.Prompt)
 	var assistant strings.Builder
 	err = s.ollama.Generate(ctx, ollama.GenerateRequest{
 		Model:  model,
 		Prompt: prompt,
+		System: systemPrompt,
 	}, func(chunk ollama.GenerateChunk) error {
 		if chunk.Response == "" {
 			return nil
