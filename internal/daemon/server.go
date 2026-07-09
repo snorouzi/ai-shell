@@ -17,6 +17,7 @@ import (
 	"ai-shell/internal/config"
 	shellcontext "ai-shell/internal/context"
 	"ai-shell/internal/ollama"
+	"ai-shell/internal/preflight"
 	"ai-shell/internal/session"
 )
 
@@ -45,6 +46,11 @@ func NewServer(cfg config.Config, ollamaClient OllamaClient, logger *log.Logger)
 }
 
 func Run(ctx context.Context, cfg config.Config) error {
+	cfg, err := preflight.Run(ctx, cfg, os.Stdin, os.Stdout)
+	if err != nil {
+		return err
+	}
+
 	logger, closeLog, err := daemonLogger(cfg.Daemon.LogFile)
 	if err != nil {
 		return err
