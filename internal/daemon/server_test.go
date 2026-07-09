@@ -33,6 +33,8 @@ func (f *fakeOllama) Tags(ctx context.Context) ([]ollama.Model, error) {
 
 func TestHandleQueryStreamsAndStoresHistory(t *testing.T) {
 	cfg := config.Default()
+	cfg.Web.Enabled = false
+	cfg.Execution.Enabled = false
 	fake := &fakeOllama{}
 	server := NewServer(cfg, fake, nil)
 
@@ -120,6 +122,8 @@ func TestModelListReportsInstalledStatus(t *testing.T) {
 
 func TestQueryUsesHistoryOnSecondPrompt(t *testing.T) {
 	cfg := config.Default()
+	cfg.Web.Enabled = false
+	cfg.Execution.Enabled = false
 	fake := &fakeOllama{}
 	server := NewServer(cfg, fake, nil)
 

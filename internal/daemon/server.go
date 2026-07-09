@@ -20,6 +20,7 @@ import (
 	"ai-shell/internal/ollama"
 	"ai-shell/internal/preflight"
 	"ai-shell/internal/session"
+	"ai-shell/internal/web"
 )
 
 type OllamaClient interface {
@@ -27,10 +28,19 @@ type OllamaClient interface {
 	Tags(context.Context) ([]ollama.Model, error)
 }
 
+// webToolInstruction tells the model it may call the web_search tool by
+// replying with a single JSON object. This is the "basic function-calling
+// loop" the spec describes, implemented against the generate endpoint.
+const webToolInstruction = "You have access to a web search tool. If the user's question " +
+	"needs current or live information (news, recent releases, documentation, prices, etc.), " +
+	`respond with ONLY a JSON object: {"web_search": "the search query"}. ` +
+	"Otherwise answer the user directly in plain text."
+
 type Server struct {
 	cfg      config.Config
 	ollama   OllamaClient
 	sessions *session.Store
+	web      *web.Client
 	logger   *log.Logger
 }
 
@@ -38,12 +48,20 @@ func NewServer(cfg config.Config, ollamaClient OllamaClient, logger *log.Logger)
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
-	return &Server{
+	server := &Server{
 		cfg:      cfg,
 		ollama:   ollamaClient,
 		sessions: session.NewStore(cfg.Session.MaxHistoryMessages),
 		logger:   logger,
 	}
+	if cfg.Web.Enabled {
+		if wc, err := web.New(cfg.Web); err != nil {
+			logger.Printf("web search disabled: %v", err)
+		} else {
+			server.web = wc
+		}
+	}
+	return server
 }
 
 func Run(ctx context.Context, cfg config.Config) error {
@@ -139,6 +157,11 @@ func (s *Server) handleQuery(ctx context.Context, w io.Writer, req Request) {
 
 	if s.cfg.Execution.Enabled {
 		s.handleExecQuery(ctx, w, req, model)
+		return
+	}
+
+	if s.cfg.Web.Enabled && s.web != nil {
+		s.handleWebQuery(ctx, w, req, model)
 		return
 	}
 
@@ -246,6 +269,76 @@ func (s *Server) handleExecuteConfirm(ctx context.Context, w io.Writer, req Requ
 	}
 	writeResponse(w, Response{Type: ResponseChunk, Content: b.String()})
 	writeResponse(w, Response{Type: ResponseDone})
+}
+
+// handleWebQuery runs a basic function-calling loop: it asks the model whether
+// the question needs current information, and if so calls SearXNG and folds the
+// results into a second, final generation. When the model answers directly, the
+// first response is streamed as-is.
+func (s *Server) handleWebQuery(ctx context.Context, w io.Writer, req Request, model string) {
+	requestContext := shellcontext.Enrich(ctx, s.cfg.Context, req.Context)
+	system := shellcontext.SystemPrompt(s.cfg.Context, requestContext)
+	if system != "" {
+		system += "\n\n"
+	}
+	system += webToolInstruction
+
+	// Turn 1: let the model decide whether to call the web_search tool.
+	var first strings.Builder
+	err := s.ollama.Generate(ctx, ollama.GenerateRequest{
+		Model:  model,
+		Prompt: s.promptWithHistory(req.SessionID, req.Prompt),
+		System: system,
+	}, func(chunk ollama.GenerateChunk) error {
+		first.WriteString(chunk.Response)
+		return nil
+	})
+	if err != nil {
+		writeResponse(w, Response{Type: ResponseError, Error: err.Error()})
+		return
+	}
+
+	query, wantsSearch := web.ParseToolCall(first.String())
+	if !wantsSearch || s.web == nil {
+		writeResponse(w, Response{Type: ResponseChunk, Content: first.String()})
+		writeResponse(w, Response{Type: ResponseDone})
+		s.sessions.AddMessages(req.SessionID,
+			session.Message{Role: "user", Content: req.Prompt},
+			session.Message{Role: "assistant", Content: first.String()},
+		)
+		return
+	}
+
+	results, serr := s.web.Search(ctx, query)
+	if serr != nil {
+		writeResponse(w, Response{Type: ResponseError, Error: "web search failed: " + serr.Error()})
+		return
+	}
+
+	// Turn 2: fold the search results into context and generate the final answer.
+	finalPrompt := fmt.Sprintf(
+		"Original question: %s\n\n%s\n\nAnswer the original question using the search results above.",
+		req.Prompt, web.Format(results))
+	var final strings.Builder
+	err = s.ollama.Generate(ctx, ollama.GenerateRequest{
+		Model:  model,
+		Prompt: finalPrompt,
+	}, func(chunk ollama.GenerateChunk) error {
+		if chunk.Response == "" {
+			return nil
+		}
+		final.WriteString(chunk.Response)
+		return writeResponse(w, Response{Type: ResponseChunk, Content: chunk.Response})
+	})
+	if err != nil {
+		writeResponse(w, Response{Type: ResponseError, Error: err.Error()})
+		return
+	}
+	writeResponse(w, Response{Type: ResponseDone})
+	s.sessions.AddMessages(req.SessionID,
+		session.Message{Role: "user", Content: req.Prompt},
+		session.Message{Role: "assistant", Content: final.String()},
+	)
 }
 
 func parseSuggestion(raw string) (execution.Suggestion, error) {
