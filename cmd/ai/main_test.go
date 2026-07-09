@@ -4,72 +4,133 @@ import (
 	"bytes"
 	"testing"
 
-	"ai-shell/internal/config"
+	"ai-shell/internal/daemon"
 )
 
-func TestParseArgsBuildsPrompt(t *testing.T) {
-	opts, err := parseArgs([]string{"explain", "this", "error"}, &bytes.Buffer{})
+func TestParseArgsBuildsQuery(t *testing.T) {
+	cmd, err := parseArgs([]string{"explain", "this", "error"}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("parseArgs returned error: %v", err)
 	}
 
-	if opts.prompt != "explain this error" {
-		t.Fatalf("prompt = %q", opts.prompt)
+	if cmd.kind != "query" {
+		t.Fatalf("kind = %q, want query", cmd.kind)
 	}
-	if opts.modelOverride != "" {
-		t.Fatalf("modelOverride = %q, want empty", opts.modelOverride)
+	if cmd.prompt != "explain this error" {
+		t.Fatalf("prompt = %q", cmd.prompt)
 	}
 }
 
 func TestParseArgsSupportsModelOverride(t *testing.T) {
-	opts, err := parseArgs([]string{"--model", "qwen2.5-coder:7b", "fix", "this"}, &bytes.Buffer{})
+	cmd, err := parseArgs([]string{"--model", "qwen2.5-coder:7b", "fix", "this"}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("parseArgs returned error: %v", err)
 	}
 
-	if opts.modelOverride != "qwen2.5-coder:7b" {
-		t.Fatalf("modelOverride = %q", opts.modelOverride)
+	if cmd.modelOverride != "qwen2.5-coder:7b" {
+		t.Fatalf("modelOverride = %q", cmd.modelOverride)
 	}
-	if opts.prompt != "fix this" {
-		t.Fatalf("prompt = %q", opts.prompt)
-	}
-}
-
-func TestParseArgsRejectsLaterCommands(t *testing.T) {
-	if _, err := parseArgs([]string{"models"}, &bytes.Buffer{}); err == nil {
-		t.Fatal("parseArgs returned nil error")
+	if cmd.prompt != "fix this" {
+		t.Fatalf("prompt = %q", cmd.prompt)
 	}
 }
 
-func TestSelectModelUsesDefaultProfile(t *testing.T) {
-	cfg := config.Default().Ollama
+func TestParseArgsModelCommands(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		modelArg string
+	}{
+		{name: "current", args: []string{"model"}},
+		{name: "reset", args: []string{"model", "reset"}, modelArg: "reset"},
+		{name: "switch", args: []string{"model", "coding"}, modelArg: "coding"},
+	}
 
-	model, err := selectModel(cfg, "")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, err := parseArgs(tt.args, &bytes.Buffer{})
+			if err != nil {
+				t.Fatalf("parseArgs returned error: %v", err)
+			}
+			if cmd.kind != "model" {
+				t.Fatalf("kind = %q, want model", cmd.kind)
+			}
+			if cmd.modelArg != tt.modelArg {
+				t.Fatalf("modelArg = %q, want %q", cmd.modelArg, tt.modelArg)
+			}
+		})
+	}
+}
+
+func TestRequestForCommand(t *testing.T) {
+	req := requestForCommand("s1", command{
+		kind:          "query",
+		modelOverride: "qwen3:4b",
+		prompt:        "hello",
+	})
+
+	if req.Type != daemon.RequestQuery {
+		t.Fatalf("Type = %q", req.Type)
+	}
+	if req.SessionID != "s1" {
+		t.Fatalf("SessionID = %q", req.SessionID)
+	}
+	if req.Model != "qwen3:4b" {
+		t.Fatalf("Model = %q", req.Model)
+	}
+}
+
+func TestRequestForModelCurrent(t *testing.T) {
+	req := requestForCommand("s1", command{kind: "model"})
+
+	if req.Type != daemon.RequestModelCurrent {
+		t.Fatalf("Type = %q", req.Type)
+	}
+}
+
+func TestHandleModelListResponse(t *testing.T) {
+	var out bytes.Buffer
+
+	done, err := handleResponse(&out, daemon.Response{
+		Type:         daemon.ResponseModelList,
+		CurrentModel: "qwen3:8b",
+		Profiles: []daemon.ModelProfile{
+			{Profile: "general", Model: "qwen3:8b", Installed: true},
+		},
+	}, nil)
 	if err != nil {
-		t.Fatalf("selectModel returned error: %v", err)
+		t.Fatalf("handleResponse returned error: %v", err)
+	}
+	if !done {
+		t.Fatal("done = false")
 	}
 
-	if model != "qwen3:8b" {
-		t.Fatalf("model = %q, want qwen3:8b", model)
+	want := "current model: qwen3:8b\ngeneral\tqwen3:8b\tinstalled\n"
+	if out.String() != want {
+		t.Fatalf("output = %q, want %q", out.String(), want)
 	}
 }
 
-func TestSelectModelUsesOverride(t *testing.T) {
-	model, err := selectModel(config.Default().Ollama, "custom:latest")
+func TestHandleChunkStopsSpinner(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	spinner := newThinkingSpinner(&stderr)
+	spinner.Start()
+
+	done, err := handleResponse(&stdout, daemon.Response{
+		Type:    daemon.ResponseChunk,
+		Content: "OK",
+	}, spinner)
 	if err != nil {
-		t.Fatalf("selectModel returned error: %v", err)
+		t.Fatalf("handleResponse returned error: %v", err)
 	}
-
-	if model != "custom:latest" {
-		t.Fatalf("model = %q, want custom:latest", model)
+	if done {
+		t.Fatal("done = true")
 	}
-}
-
-func TestSelectModelRejectsMissingDefaultProfile(t *testing.T) {
-	cfg := config.Default().Ollama
-	cfg.DefaultProfile = "missing"
-
-	if _, err := selectModel(cfg, ""); err == nil {
-		t.Fatal("selectModel returned nil error")
+	if stdout.String() != "OK" {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+	if !bytes.Contains(stderr.Bytes(), []byte("\033[2K")) {
+		t.Fatalf("stderr did not contain clear-line escape: %q", stderr.String())
 	}
 }
