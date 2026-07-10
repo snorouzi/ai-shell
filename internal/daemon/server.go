@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"ai-shell/internal/config"
 	shellcontext "ai-shell/internal/context"
@@ -42,6 +43,10 @@ type Server struct {
 	sessions *session.Store
 	web      *web.Client
 	logger   *log.Logger
+
+	// mu guards mutable access to cfg.Ollama.Models, which the model-add
+	// command updates at runtime while other requests read it concurrently.
+	mu sync.RWMutex
 }
 
 func NewServer(cfg config.Config, ollamaClient OllamaClient, logger *log.Logger) *Server {
@@ -141,6 +146,10 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		s.handleModelCurrent(conn, req)
 	case RequestModelList:
 		s.handleModelList(ctx, conn, req)
+	case RequestModelAdd:
+		s.handleModelAdd(ctx, conn, req)
+	case RequestModelRemove:
+		s.handleModelRemove(conn, req)
 	case RequestExecuteConfirm:
 		s.handleExecuteConfirm(ctx, conn, req)
 	default:
@@ -446,8 +455,9 @@ func (s *Server) handleModelList(ctx context.Context, w io.Writer, req Request) 
 	}
 
 	profiles := make([]ModelProfile, 0, len(s.cfg.Ollama.Models))
-	for _, profile := range sortedKeys(s.cfg.Ollama.Models) {
-		model := s.cfg.Ollama.Models[profile]
+	models := s.modelProfiles()
+	for _, profile := range sortedKeys(models) {
+		model := models[profile]
 		profiles = append(profiles, ModelProfile{
 			Profile:   profile,
 			Model:     model,
@@ -474,6 +484,115 @@ func (s *Server) handleModelList(ctx context.Context, w io.Writer, req Request) 
 	})
 }
 
+// handleModelAdd registers a new profile->model mapping. It persists the change
+// to the config file (surgically, touching only ollama.models) and updates the
+// running daemon's in-memory map so the profile is usable immediately without a
+// restart. The model tag need not be installed yet; the response reports its
+// install status so the client can hint at `ollama pull`.
+func (s *Server) handleModelAdd(ctx context.Context, w io.Writer, req Request) {
+	profile := strings.TrimSpace(req.Profile)
+	model := strings.TrimSpace(req.Model)
+	if profile == "" || model == "" {
+		writeResponse(w, Response{Type: ResponseError, Error: "usage: ai model-add <profile> <model-tag>"})
+		return
+	}
+	if profile == "reset" {
+		writeResponse(w, Response{Type: ResponseError, Error: `"reset" is reserved and cannot be used as a profile name`})
+		return
+	}
+
+	path, err := s.configPath()
+	if err != nil {
+		writeResponse(w, Response{Type: ResponseError, Error: err.Error()})
+		return
+	}
+
+	if err := config.AddProfile(path, profile, model); err != nil {
+		writeResponse(w, Response{Type: ResponseError, Error: err.Error()})
+		return
+	}
+
+	// Reflect the change in the running daemon immediately.
+	s.mu.Lock()
+	if s.cfg.Ollama.Models == nil {
+		s.cfg.Ollama.Models = make(map[string]string)
+	}
+	s.cfg.Ollama.Models[profile] = model
+	s.mu.Unlock()
+
+	added := ModelProfile{Profile: profile, Model: model}
+	if installed, err := s.installedModels(ctx); err == nil {
+		added.Installed = installed[model]
+	} else {
+		// The profile was saved; we just can't confirm install state. Report
+		// it as installed so the client doesn't emit a misleading pull hint.
+		s.logger.Printf("model-add: could not verify install status for %q: %v", model, err)
+		added.Installed = true
+	}
+
+	writeResponse(w, Response{
+		Type:     ResponseModelAdd,
+		Profiles: []ModelProfile{added},
+	})
+}
+
+// handleModelRemove deletes a profile->model mapping. It refuses to remove the
+// default profile (which would leave the daemon with no fallback model) and
+// requires the profile to exist. The change is persisted (surgically) and
+// applied to the running daemon immediately. Existing sessions that switched to
+// this profile are unaffected because they store the resolved model tag, not the
+// profile name.
+func (s *Server) handleModelRemove(w io.Writer, req Request) {
+	profile := strings.TrimSpace(req.Profile)
+	if profile == "" {
+		writeResponse(w, Response{Type: ResponseError, Error: "usage: ai model-rm <profile>"})
+		return
+	}
+
+	s.mu.RLock()
+	_, exists := s.cfg.Ollama.Models[profile]
+	isDefault := s.cfg.Ollama.DefaultProfile == profile
+	s.mu.RUnlock()
+
+	if !exists {
+		writeResponse(w, Response{Type: ResponseError, Error: fmt.Sprintf("profile %q is not defined", profile)})
+		return
+	}
+	if isDefault {
+		writeResponse(w, Response{Type: ResponseError, Error: fmt.Sprintf("cannot remove %q: it is the default profile (ollama.default_profile)", profile)})
+		return
+	}
+
+	path, err := s.configPath()
+	if err != nil {
+		writeResponse(w, Response{Type: ResponseError, Error: err.Error()})
+		return
+	}
+
+	if err := config.RemoveProfile(path, profile); err != nil {
+		writeResponse(w, Response{Type: ResponseError, Error: err.Error()})
+		return
+	}
+
+	s.mu.Lock()
+	delete(s.cfg.Ollama.Models, profile)
+	s.mu.Unlock()
+
+	writeResponse(w, Response{
+		Type:     ResponseModelRemove,
+		Profiles: []ModelProfile{{Profile: profile}},
+	})
+}
+
+// configPath returns the path of the config file this daemon uses, falling back
+// to the default location when the loaded config had no backing file.
+func (s *Server) configPath() (string, error) {
+	if path := s.cfg.FilePath(); path != "" {
+		return path, nil
+	}
+	return config.Path()
+}
+
 func (s *Server) modelForQuery(sessionID, override string) (string, error) {
 	if override != "" {
 		return override, nil
@@ -489,12 +608,16 @@ func (s *Server) effectiveSessionModel(sessionID string) (string, error) {
 }
 
 func (s *Server) defaultModel() (string, error) {
-	if s.cfg.Ollama.DefaultProfile == "" {
+	s.mu.RLock()
+	profile := s.cfg.Ollama.DefaultProfile
+	model, ok := s.cfg.Ollama.Models[profile]
+	s.mu.RUnlock()
+
+	if profile == "" {
 		return "", errors.New("ollama.default_profile is empty")
 	}
-	model, ok := s.cfg.Ollama.Models[s.cfg.Ollama.DefaultProfile]
 	if !ok || model == "" {
-		return "", fmt.Errorf("ollama.default_profile %q is not defined in ollama.models", s.cfg.Ollama.DefaultProfile)
+		return "", fmt.Errorf("ollama.default_profile %q is not defined in ollama.models", profile)
 	}
 	return model, nil
 }
@@ -503,7 +626,7 @@ func (s *Server) resolveModel(ctx context.Context, profileOrTag string) (string,
 	if profileOrTag == "" {
 		return "", errors.New("model is required")
 	}
-	if model, ok := s.cfg.Ollama.Models[profileOrTag]; ok {
+	if model, ok := s.modelForProfile(profileOrTag); ok {
 		profileOrTag = model
 	}
 
@@ -515,6 +638,26 @@ func (s *Server) resolveModel(ctx context.Context, profileOrTag string) (string,
 		return "", fmt.Errorf("model %q is not installed in Ollama", profileOrTag)
 	}
 	return profileOrTag, nil
+}
+
+// modelForProfile returns the model tag mapped to a profile name, if any.
+func (s *Server) modelForProfile(profile string) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	model, ok := s.cfg.Ollama.Models[profile]
+	return model, ok
+}
+
+// modelProfiles returns a snapshot copy of the profile->model map so callers can
+// iterate it without holding the lock.
+func (s *Server) modelProfiles() map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]string, len(s.cfg.Ollama.Models))
+	for profile, model := range s.cfg.Ollama.Models {
+		out[profile] = model
+	}
+	return out
 }
 
 func (s *Server) installedModels(ctx context.Context) (map[string]bool, error) {

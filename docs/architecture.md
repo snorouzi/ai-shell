@@ -67,16 +67,56 @@ disable web search, never the whole app.
 
 ---
 
+## Daemon lifecycle & restarting it
+
+The daemon is a long-lived process spawned lazily by the first client call (or
+started manually / via systemd). It holds the config, Ollama client, and
+per-session memory **in memory**, so a running daemon keeps serving the code and
+config it started with until it exits.
+
+It stops on its own when it has been idle for `daemon.idle_timeout_minutes`, and
+a fresh one is spawned automatically on the next `ai` call. When you want the
+change to apply *now* — after rebuilding the binary, or after editing settings
+that are only read at daemon startup — restart it explicitly:
+
+```bash
+pkill -f 'ai daemon'
+```
+
+**What this does:** `pkill -f` matches against the full command line, and the
+lazily-spawned daemon runs as `<path>/ai daemon` (see `ensureDaemon` in
+`cmd/ai/main.go`, which execs `os.Executable()` with the `daemon` argument). So
+this pattern terminates the running daemon process.
+
+**Why you rarely need more than this:** you do **not** have to start the daemon
+again by hand. The very next `ai <query>` dials the socket, finds it dead, and
+spawns a new daemon from the current binary automatically. Running `ai daemon`
+manually is only useful when you want to watch its output in the foreground.
+
+Notes and caveats:
+
+- Rebuilding the binary (`go build -o ~/go/bin/ai ./cmd/ai`) does **not** affect
+  the already-running daemon; it keeps executing the old code in memory until
+  restarted. The client is a fresh process each call, so client-only changes
+  (arg parsing, Markdown rendering) take effect without a restart.
+- Runtime commands like `ai model-add` / `ai model-rm` update the live daemon's
+  state directly, so those specifically do **not** need a restart.
+- If you run the daemon as a systemd user unit instead of lazy-spawn, use
+  `systemctl --user restart ai-shell` rather than `pkill`.
+
+---
+
 ## Request / response protocol
 
 `internal/daemon/protocol.go` defines newline-delimited JSON over the socket.
 
 **Request types:** `query`, `model_switch`, `model_current`, `model_list`,
-`execute_confirm`.
+`model_add`, `model_remove`, `execute_confirm`.
 
 **Response types:** `chunk` (streamed token), `searching` (web indicator),
 `notice` (non-fatal info, e.g. web unavailable), `done`, `error`,
-`model`, `model_list`, `model_switch`, `suggestion`.
+`model`, `model_list`, `model_switch`, `model_add`, `model_remove`,
+`suggestion`.
 
 The client renders `chunk`s verbatim as they arrive, then re-renders the full
 answer as Markdown on a TTY (clearing the plain text first) when

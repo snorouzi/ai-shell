@@ -35,6 +35,7 @@ type command struct {
 	kind          string
 	modelOverride string
 	modelArg      string
+	profileArg    string
 	prompt        string
 }
 
@@ -106,6 +107,19 @@ func parseArgs(args []string, stderr io.Writer) (command, error) {
 			return command{}, errors.New("usage: ai models")
 		}
 		cmd.kind = "models"
+	case "model-add":
+		if len(remaining) != 3 {
+			return command{}, errors.New("usage: ai model-add <profile> <model-tag>")
+		}
+		cmd.kind = "model-add"
+		cmd.profileArg = remaining[1]
+		cmd.modelArg = remaining[2]
+	case "model-rm":
+		if len(remaining) != 2 {
+			return command{}, errors.New("usage: ai model-rm <profile>")
+		}
+		cmd.kind = "model-rm"
+		cmd.profileArg = remaining[1]
 	case "model":
 		cmd.kind = "model"
 		switch len(remaining) {
@@ -222,6 +236,19 @@ func requestForCommand(sessionID string, cmd command) daemon.Request {
 	switch cmd.kind {
 	case "models":
 		return daemon.Request{Type: daemon.RequestModelList, SessionID: sessionID}
+	case "model-add":
+		return daemon.Request{
+			Type:      daemon.RequestModelAdd,
+			SessionID: sessionID,
+			Profile:   cmd.profileArg,
+			Model:     cmd.modelArg,
+		}
+	case "model-rm":
+		return daemon.Request{
+			Type:      daemon.RequestModelRemove,
+			SessionID: sessionID,
+			Profile:   cmd.profileArg,
+		}
 	case "model":
 		req := daemon.Request{Type: daemon.RequestModelSwitch, SessionID: sessionID}
 		if cmd.modelArg == "" {
@@ -273,6 +300,10 @@ func handleResponse(conn net.Conn, cfg config.Config, sessionID string, stdout i
 		return true, err
 	case daemon.ResponseModelList:
 		return true, printModels(stdout, resp)
+	case daemon.ResponseModelAdd:
+		return true, printModelAdd(stdout, resp)
+	case daemon.ResponseModelRemove:
+		return true, printModelRemove(stdout, resp)
 	default:
 		return true, fmt.Errorf("unknown response type %q", resp.Type)
 	}
@@ -325,6 +356,31 @@ func handleSuggestion(conn net.Conn, cfg config.Config, sessionID string, stdout
 	})
 }
 
+func printModelAdd(stdout io.Writer, resp daemon.Response) error {
+	if len(resp.Profiles) == 0 {
+		_, err := fmt.Fprintln(stdout, "profile added")
+		return err
+	}
+	p := resp.Profiles[0]
+	if _, err := fmt.Fprintf(stdout, "added profile %q -> %s\n", p.Profile, p.Model); err != nil {
+		return err
+	}
+	if !p.Installed {
+		_, err := fmt.Fprintf(stdout, "note: %s is not installed yet — run: ollama pull %s\n", p.Model, p.Model)
+		return err
+	}
+	return nil
+}
+
+func printModelRemove(stdout io.Writer, resp daemon.Response) error {
+	if len(resp.Profiles) == 0 {
+		_, err := fmt.Fprintln(stdout, "profile removed")
+		return err
+	}
+	_, err := fmt.Fprintf(stdout, "removed profile %q\n", resp.Profiles[0].Profile)
+	return err
+}
+
 func printModels(stdout io.Writer, resp daemon.Response) error {
 	if resp.CurrentModel != "" {
 		if _, err := fmt.Fprintf(stdout, "current model: %s\n", resp.CurrentModel); err != nil {
@@ -353,6 +409,8 @@ Common Commands:
   model <name>         Switch the session model to a profile or raw model tag
   model reset          Clear the session override; revert to the config default
   models               List configured profiles and their installed status
+  model-add <p> <tag>  Add or update a model profile <p> mapped to <tag> (persisted)
+  model-rm <p>         Remove the model profile <p> (persisted)
 
 Management Commands:
   daemon               Run the daemon directly (normally started automatically)
@@ -367,6 +425,8 @@ Examples:
   ai explain why my docker container is failing
   ai model coding
   ai model reset
+  ai model-add vision llava:7b
+  ai model-rm vision
   ai --model qwen2.5-coder:7b "why doesn't this regex match?"
   ai models
 

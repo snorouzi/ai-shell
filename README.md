@@ -185,6 +185,8 @@ All commands are sub-commands / argument shapes of the single `ai` binary.
 | `ai model <profile-or-tag>` | Switch the session's model to a profile (`general`, `coding`, …) or a raw model tag. |
 | `ai model reset`            | Clear the session override; revert to `ollama.default_profile`.                      |
 | `ai models`                 | List configured profiles, their installed status, and the current session model.     |
+| `ai model-add <name> <tag>` | Add or update a model profile (persisted to config); usable immediately.             |
+| `ai model-rm <name>`        | Remove a model profile (persisted); cannot remove the default profile.               |
 | `ai daemon`                 | Run the daemon directly (normally started automatically).                            |
 | `ai --help` / `ai help`     | Show available commands, options, and usage examples.                                |
 
@@ -209,6 +211,13 @@ ai --model qwen2.5-coder:7b "why doesn't this regex match?"
 
 # List profiles
 ai models
+
+# Add (or update) a model profile — persisted to config.yaml and usable at once
+ai model-add vision llava:7b
+ai model vision            # then switch to it like any other profile
+
+# Remove a profile you no longer want (the default profile is protected)
+ai model-rm vision
 ```
 
 Session state is in-memory only and tied to the shell. Closing the terminal (or

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -117,6 +118,157 @@ func TestModelListReportsInstalledStatus(t *testing.T) {
 	}
 	if !generalInstalled {
 		t.Fatal("general profile should be installed")
+	}
+}
+
+func TestModelAddPersistsAndUpdatesRunningDaemon(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+
+	cfg := config.Default()
+	if err := cfg.SaveFile(path); err != nil {
+		t.Fatalf("SaveFile returned error: %v", err)
+	}
+	loaded, err := config.LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile returned error: %v", err)
+	}
+
+	fake := &fakeOllama{models: []ollama.Model{{Name: "llava:7b"}}}
+	server := NewServer(loaded, fake, nil)
+
+	responses := exchange(t, server, Request{
+		Type:      RequestModelAdd,
+		SessionID: "s1",
+		Profile:   "vision",
+		Model:     "llava:7b",
+	})
+
+	if len(responses) != 1 {
+		t.Fatalf("len(responses) = %d, want 1: %#v", len(responses), responses)
+	}
+	if responses[0].Type != ResponseModelAdd {
+		t.Fatalf("Type = %q, want %q", responses[0].Type, ResponseModelAdd)
+	}
+	if len(responses[0].Profiles) != 1 {
+		t.Fatalf("Profiles = %#v", responses[0].Profiles)
+	}
+	added := responses[0].Profiles[0]
+	if added.Profile != "vision" || added.Model != "llava:7b" || !added.Installed {
+		t.Fatalf("added profile = %#v", added)
+	}
+
+	// Persisted to disk.
+	reloaded, err := config.LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile returned error: %v", err)
+	}
+	if reloaded.Ollama.Models["vision"] != "llava:7b" {
+		t.Fatalf("persisted vision model = %q", reloaded.Ollama.Models["vision"])
+	}
+
+	// Usable immediately by the running daemon (switch resolves the profile).
+	switchResp := exchange(t, server, Request{
+		Type:      RequestModelSwitch,
+		SessionID: "s1",
+		Model:     "vision",
+	})
+	if switchResp[0].Type != ResponseModelSwitch || switchResp[0].CurrentModel != "llava:7b" {
+		t.Fatalf("switch response = %#v", switchResp[0])
+	}
+}
+
+func TestModelAddRejectsReserved(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	cfg := config.Default()
+	if err := cfg.SaveFile(path); err != nil {
+		t.Fatalf("SaveFile returned error: %v", err)
+	}
+	loaded, _ := config.LoadFile(path)
+
+	server := NewServer(loaded, &fakeOllama{}, nil)
+	responses := exchange(t, server, Request{
+		Type:      RequestModelAdd,
+		SessionID: "s1",
+		Profile:   "reset",
+		Model:     "llava:7b",
+	})
+	if responses[0].Type != ResponseError {
+		t.Fatalf("Type = %q, want error", responses[0].Type)
+	}
+}
+
+func TestModelRemovePersistsAndUpdatesRunningDaemon(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+
+	cfg := config.Default()
+	if err := cfg.SaveFile(path); err != nil {
+		t.Fatalf("SaveFile returned error: %v", err)
+	}
+	loaded, err := config.LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile returned error: %v", err)
+	}
+
+	server := NewServer(loaded, &fakeOllama{}, nil)
+
+	responses := exchange(t, server, Request{
+		Type:      RequestModelRemove,
+		SessionID: "s1",
+		Profile:   "coding",
+	})
+
+	if len(responses) != 1 {
+		t.Fatalf("len(responses) = %d, want 1: %#v", len(responses), responses)
+	}
+	if responses[0].Type != ResponseModelRemove {
+		t.Fatalf("Type = %q, want %q", responses[0].Type, ResponseModelRemove)
+	}
+	if len(responses[0].Profiles) != 1 || responses[0].Profiles[0].Profile != "coding" {
+		t.Fatalf("Profiles = %#v", responses[0].Profiles)
+	}
+
+	// Removed from disk.
+	reloaded, err := config.LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile returned error: %v", err)
+	}
+	if _, ok := reloaded.Ollama.Models["coding"]; ok {
+		t.Fatal("coding profile still present on disk")
+	}
+
+	// Removed from the running daemon: switching to it now fails.
+	switchResp := exchange(t, server, Request{
+		Type:      RequestModelSwitch,
+		SessionID: "s1",
+		Model:     "coding",
+	})
+	if switchResp[0].Type != ResponseError {
+		t.Fatalf("switch to removed profile = %#v, want error", switchResp[0])
+	}
+}
+
+func TestModelRemoveRejectsDefaultAndMissing(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	cfg := config.Default()
+	if err := cfg.SaveFile(path); err != nil {
+		t.Fatalf("SaveFile returned error: %v", err)
+	}
+	loaded, _ := config.LoadFile(path)
+	server := NewServer(loaded, &fakeOllama{}, nil)
+
+	// default_profile defaults to "general" — must be protected.
+	def := exchange(t, server, Request{Type: RequestModelRemove, SessionID: "s1", Profile: "general"})
+	if def[0].Type != ResponseError {
+		t.Fatalf("removing default profile = %#v, want error", def[0])
+	}
+
+	missing := exchange(t, server, Request{Type: RequestModelRemove, SessionID: "s1", Profile: "nope"})
+	if missing[0].Type != ResponseError {
+		t.Fatalf("removing missing profile = %#v, want error", missing[0])
 	}
 }
 

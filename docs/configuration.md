@@ -54,6 +54,21 @@ Connection and model settings for the local inference backend.
 `models` is a free-form map, not a fixed enum — add profiles like
 `big: qwen3:14b` and they immediately become available to `ai model big`.
 
+You can add or update profiles without hand-editing this file using
+`ai model-add <profile> <model-tag>` (e.g. `ai model-add vision llava:7b`). It
+writes the entry into `ollama.models` here — preserving your other settings,
+templated paths (`${XDG_RUNTIME_DIR}`, `~`), and key ordering — and the running
+daemon picks it up immediately, so no restart is needed. The model tag does not
+have to be installed yet; if it isn't, the command reminds you to `ollama pull`
+it.
+
+Remove a profile with `ai model-rm <profile>` (e.g. `ai model-rm vision`). It
+deletes the entry the same surgical way and takes effect immediately. The
+`default_profile` cannot be removed, since the daemon needs a fallback model.
+Because the config file is authoritative for `ollama.models`, a removed profile
+stays removed across restarts (even the shipped `general`/`coding`/`fast`
+entries).
+
 ---
 
 ## `daemon`

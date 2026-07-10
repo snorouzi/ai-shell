@@ -7,6 +7,8 @@ const (
 	RequestModelSwitch   = "model_switch"
 	RequestModelCurrent  = "model_current"
 	RequestModelList     = "model_list"
+	RequestModelAdd      = "model_add"
+	RequestModelRemove   = "model_remove"
 	RequestExecuteConfirm = "execute_confirm"
 
 	ResponseChunk       = "chunk"
@@ -17,6 +19,8 @@ const (
 	ResponseModel       = "model"
 	ResponseModelList   = "model_list"
 	ResponseModelSwitch = "model_switch"
+	ResponseModelAdd    = "model_add"
+	ResponseModelRemove = "model_remove"
 	ResponseSuggestion  = "suggestion"
 )
 
@@ -25,6 +29,7 @@ type Request struct {
 	SessionID string `json:"session_id"`
 	Prompt    string `json:"prompt,omitempty"`
 	Model     string `json:"model,omitempty"`
+	Profile   string `json:"profile,omitempty"`
 	Reset     bool   `json:"reset,omitempty"`
 	Approve   bool   `json:"approve,omitempty"`
 	Context   shellcontext.Payload `json:"context,omitempty"`

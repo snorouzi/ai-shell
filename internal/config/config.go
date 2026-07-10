@@ -2,8 +2,10 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -188,6 +190,22 @@ func LoadFile(path string) (Config, error) {
 		return Config{}, err
 	}
 
+	// yaml.v3 merges into the existing (default) Models map rather than
+	// replacing it, which would silently re-add profiles a user removed from
+	// the file. Detect whether the file explicitly defines ollama.models and,
+	// if so, treat the file as authoritative for that map.
+	var probe struct {
+		Ollama struct {
+			Models map[string]string `yaml:"models"`
+		} `yaml:"ollama"`
+	}
+	if err := yaml.Unmarshal(data, &probe); err != nil {
+		return Config{}, err
+	}
+	if probe.Ollama.Models != nil {
+		cfg.Ollama.Models = probe.Ollama.Models
+	}
+
 	cfg.path = path
 	cfg.expandPaths()
 	return cfg, nil
@@ -219,6 +237,178 @@ func (c Config) SaveFile(path string) error {
 	}
 
 	return os.WriteFile(path, data, 0o644)
+}
+
+// FilePath reports the path this config was loaded from, or "" when it came
+// from Default() without a backing file.
+func (c Config) FilePath() string {
+	return c.path
+}
+
+// AddProfile persistently adds or updates a single entry under ollama.models in
+// the config file at path. It edits the YAML surgically via the node API so all
+// other content is preserved verbatim — including templated paths like
+// ${XDG_RUNTIME_DIR} and ~, comments, and key ordering. When the file does not
+// exist yet it is seeded from Default() (which keeps those path templates). This
+// is deliberately used instead of Config.Save() so the daemon never rewrites
+// unrelated, already-expanded fields from its in-memory config.
+func AddProfile(path, profile, model string) error {
+	profile = strings.TrimSpace(profile)
+	model = strings.TrimSpace(model)
+	if profile == "" {
+		return errors.New("profile name is required")
+	}
+	if model == "" {
+		return errors.New("model tag is required")
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if data, err = yaml.Marshal(Default()); err != nil {
+			return err
+		}
+	}
+
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return err
+	}
+
+	root := documentRoot(&doc)
+	ollama := ensureMapping(root, "ollama")
+	models := ensureMapping(ollama, "models")
+	setScalar(models, profile, model)
+
+	out, err := yaml.Marshal(&doc)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, out, 0o644)
+}
+
+// RemoveProfile persistently deletes an entry from ollama.models in the config
+// file at path, editing the YAML surgically so all other content is preserved.
+// It returns an error when the file, the ollama.models mapping, or the profile
+// does not exist.
+func RemoveProfile(path, profile string) error {
+	profile = strings.TrimSpace(profile)
+	if profile == "" {
+		return errors.New("profile name is required")
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("profile %q not found", profile)
+		}
+		return err
+	}
+
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return err
+	}
+
+	root := documentRoot(&doc)
+	ollama := mappingValue(root, "ollama")
+	if ollama == nil {
+		return fmt.Errorf("profile %q not found", profile)
+	}
+	models := mappingValue(ollama, "models")
+	if models == nil || models.Kind != yaml.MappingNode || !deleteKey(models, profile) {
+		return fmt.Errorf("profile %q not found", profile)
+	}
+
+	out, err := yaml.Marshal(&doc)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, out, 0o644)
+}
+
+// documentRoot returns the top-level mapping node of a parsed YAML document,
+// initialising an empty mapping when the document is blank.
+func documentRoot(doc *yaml.Node) *yaml.Node {
+	if doc.Kind == 0 {
+		doc.Kind = yaml.DocumentNode
+	}
+	if doc.Kind == yaml.DocumentNode {
+		if len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+			doc.Content = []*yaml.Node{{Kind: yaml.MappingNode, Tag: "!!map"}}
+		}
+		return doc.Content[0]
+	}
+	return doc
+}
+
+// mappingValue returns the value node stored under key in a mapping node, or nil.
+func mappingValue(node *yaml.Node, key string) *yaml.Node {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == key {
+			return node.Content[i+1]
+		}
+	}
+	return nil
+}
+
+// ensureMapping returns the mapping value stored under key in parent, creating
+// (or coercing) it to an empty mapping when absent or not already a mapping.
+func ensureMapping(parent *yaml.Node, key string) *yaml.Node {
+	if v := mappingValue(parent, key); v != nil {
+		if v.Kind != yaml.MappingNode {
+			v.Kind = yaml.MappingNode
+			v.Tag = "!!map"
+			v.Value = ""
+			v.Content = nil
+		}
+		return v
+	}
+	keyNode := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}
+	valNode := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+	parent.Content = append(parent.Content, keyNode, valNode)
+	return valNode
+}
+
+// setScalar sets key to a string value in a mapping node, updating the existing
+// entry in place when present or appending a new one otherwise.
+func setScalar(mapping *yaml.Node, key, value string) {
+	if v := mappingValue(mapping, key); v != nil {
+		v.Kind = yaml.ScalarNode
+		v.Tag = "!!str"
+		v.Value = value
+		v.Content = nil
+		return
+	}
+	keyNode := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}
+	valNode := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: value}
+	mapping.Content = append(mapping.Content, keyNode, valNode)
+}
+
+// deleteKey removes the key/value pair stored under key from a mapping node,
+// reporting whether an entry was actually removed.
+func deleteKey(mapping *yaml.Node, key string) bool {
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		return false
+	}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			mapping.Content = append(mapping.Content[:i], mapping.Content[i+2:]...)
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Config) expandPaths() {
