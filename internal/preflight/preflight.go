@@ -78,27 +78,28 @@ func Run(ctx context.Context, cfg config.Config, in io.Reader, out io.Writer) (c
 }
 
 // checkOllamaInstalled verifies the ollama binary is on PATH. When it is not,
-// it detects the GPU vendor and prints the right Arch install command.
+// it detects the GPU vendor and prints distro-agnostic install guidance, using
+// Arch Linux commands only as a concrete example.
 func checkOllamaInstalled(out io.Writer) error {
 	if _, err := exec.LookPath("ollama"); err == nil {
 		return nil
 	}
 
 	vendor := detectGPUVendor()
-	pkg := "ollama"
+	fmt.Fprintln(out, "Ollama is not installed.")
 	switch vendor {
 	case "nvidia":
-		pkg = "ollama-cuda"
+		fmt.Fprintln(out, "An NVIDIA GPU was detected — look for an Ollama build with CUDA support.")
 	case "amd":
-		pkg = "ollama-rocm"
+		fmt.Fprintln(out, "An AMD GPU was detected — look for an Ollama build with ROCm support.")
+	default:
+		fmt.Fprintln(out, "No GPU was detected — a CPU-only Ollama build will work but is slow.")
 	}
-
-	fmt.Fprintln(out, "Ollama is not installed.")
-	if vendor == "none" {
-		fmt.Fprintln(out, "No GPU detected — the base ollama package runs inference on CPU (slow).")
-	}
-	fmt.Fprintf(out, "Install it with: sudo pacman -S %s\n", pkg)
-	fmt.Fprintln(out, "Then enable the service: sudo systemctl enable --now ollama")
+	fmt.Fprintln(out, "Install Ollama via your distribution's package manager, then enable and start its service.")
+	fmt.Fprintln(out, "Example (Arch Linux):")
+	fmt.Fprintln(out, "  sudo pacman -S ollama-cuda   # NVIDIA (use ollama-rocm for AMD, ollama for CPU)")
+	fmt.Fprintln(out, "  sudo systemctl enable --now ollama")
+	fmt.Fprintln(out, "Find the equivalent package and service name for your distribution.")
 	return fmt.Errorf("ollama is not installed")
 }
 
@@ -106,8 +107,11 @@ func checkOllamaInstalled(out io.Writer) error {
 func checkOllamaReachable(ctx context.Context, client *ollama.Client, out io.Writer) error {
 	if _, err := client.Tags(ctx); err != nil {
 		fmt.Fprintln(out, "Ollama is installed but the daemon is not reachable.")
-		fmt.Fprintln(out, "Check its status: sudo systemctl status ollama")
-		fmt.Fprintln(out, "Enable and start it: sudo systemctl enable --now ollama")
+		fmt.Fprintln(out, "Start the Ollama service (it must be running for AI Shell to work).")
+		fmt.Fprintln(out, "Example (Arch Linux with systemd):")
+		fmt.Fprintln(out, "  sudo systemctl status ollama")
+		fmt.Fprintln(out, "  sudo systemctl enable --now ollama")
+		fmt.Fprintln(out, "Adapt these to your distribution's service manager.")
 		return fmt.Errorf("ollama daemon unreachable: %w", err)
 	}
 	return nil
