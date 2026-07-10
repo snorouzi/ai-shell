@@ -63,6 +63,33 @@ func TestParseArgsModelCommands(t *testing.T) {
 	}
 }
 
+func TestParseArgsHelp(t *testing.T) {
+	for _, args := range [][]string{
+		{"--help"},
+		{"-h"},
+		{"help"},
+	} {
+		cmd, err := parseArgs(args, &bytes.Buffer{})
+		if err != nil {
+			t.Fatalf("parseArgs(%v) returned error: %v", args, err)
+		}
+		if cmd.kind != "help" {
+			t.Fatalf("parseArgs(%v) kind = %q, want help", args, cmd.kind)
+		}
+	}
+}
+
+func TestPrintHelpMentionsCommands(t *testing.T) {
+	var out bytes.Buffer
+	printHelp(&out)
+
+	for _, want := range []string{"Usage:", "model", "models", "daemon", "--model", "-h, --help"} {
+		if !bytes.Contains(out.Bytes(), []byte(want)) {
+			t.Fatalf("help output missing %q\n%s", want, out.String())
+		}
+	}
+}
+
 func TestRequestForCommand(t *testing.T) {
 	req := requestForCommand("s1", command{
 		kind:          "query",

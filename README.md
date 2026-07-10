@@ -186,6 +186,7 @@ All commands are sub-commands / argument shapes of the single `ai` binary.
 | `ai model reset`            | Clear the session override; revert to `ollama.default_profile`.                      |
 | `ai models`                 | List configured profiles, their installed status, and the current session model.     |
 | `ai daemon`                 | Run the daemon directly (normally started automatically).                            |
+| `ai --help` / `ai help`     | Show available commands, options, and usage examples.                                |
 
 ### Examples
 

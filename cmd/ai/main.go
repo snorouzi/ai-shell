@@ -44,6 +44,11 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
+	if cmd.kind == "help" {
+		printHelp(stdout)
+		return nil
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -69,11 +74,17 @@ func run(args []string, stdout, stderr io.Writer) error {
 func parseArgs(args []string, stderr io.Writer) (command, error) {
 	flags := flag.NewFlagSet("ai", flag.ContinueOnError)
 	flags.SetOutput(stderr)
+	// Suppress flag's default usage output; we render our own help text.
+	flags.Usage = func() {}
 
 	var cmd command
 	flags.StringVar(&cmd.modelOverride, "model", "", "use a model tag for this query only")
 
 	if err := flags.Parse(args); err != nil {
+		// -h/--help make flag.Parse return flag.ErrHelp; treat it as the help command.
+		if errors.Is(err, flag.ErrHelp) {
+			return command{kind: "help"}, nil
+		}
 		return command{}, err
 	}
 
@@ -83,6 +94,8 @@ func parseArgs(args []string, stderr io.Writer) (command, error) {
 	}
 
 	switch remaining[0] {
+	case "help":
+		cmd.kind = "help"
 	case "daemon":
 		if len(remaining) != 1 {
 			return command{}, errors.New("usage: ai daemon")
@@ -328,6 +341,42 @@ func printModels(stdout io.Writer, resp daemon.Response) error {
 		}
 	}
 	return nil
+}
+
+const helpText = `Usage:  ai [OPTIONS] COMMAND [ARGS]
+
+A local-first AI assistant for your Zsh shell, powered by Ollama.
+
+Common Commands:
+  <query>              Ask a question; streams the answer back
+  model                Show the current session's model
+  model <name>         Switch the session model to a profile or raw model tag
+  model reset          Clear the session override; revert to the config default
+  models               List configured profiles and their installed status
+
+Management Commands:
+  daemon               Run the daemon directly (normally started automatically)
+  help                 Show this help message
+
+Global Options:
+  --model string       Use a model tag for this query only (does not change the session)
+  -h, --help           Show help information
+
+Examples:
+  ai how do I check which process is using port 8080
+  ai explain why my docker container is failing
+  ai model coding
+  ai model reset
+  ai --model qwen2.5-coder:7b "why doesn't this regex match?"
+  ai models
+
+For more information, head to https://github.com/saeedNW/ai-shell
+`
+
+// printHelp writes the top-level help text describing available commands and
+// options, mirroring the layout of familiar CLIs like docker.
+func printHelp(w io.Writer) {
+	fmt.Fprint(w, helpText)
 }
 
 func sessionID() string {
