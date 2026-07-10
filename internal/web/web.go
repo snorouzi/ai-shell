@@ -26,15 +26,21 @@ type Client struct {
 }
 
 // New builds a SearXNG client. It only makes sense when web.search is enabled
-// and a URL is configured.
+// and a port is configured. AI Shell owns the container, so the URL is always
+// http://localhost:<port>.
 func New(cfg config.WebConfig) (*Client, error) {
-	if cfg.SearxngURL == "" {
-		return nil, fmt.Errorf("web.searxng_url is required")
+	port := cfg.SearxngPort
+	if port == 0 {
+		port = 8081
 	}
+	return newClient(fmt.Sprintf("http://localhost:%d", port)), nil
+}
+
+func newClient(baseURL string) *Client {
 	return &Client{
-		baseURL:    strings.TrimRight(cfg.SearxngURL, "/"),
+		baseURL:    baseURL,
 		httpClient: &http.Client{Timeout: 15 * time.Second},
-	}, nil
+	}
 }
 
 type searchResponse struct {

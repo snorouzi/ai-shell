@@ -14,6 +14,7 @@ import (
 
 	"ai-shell/internal/config"
 	"ai-shell/internal/ollama"
+	"ai-shell/internal/searxng"
 )
 
 const cacheFileName = "preflight.ok"
@@ -70,6 +71,17 @@ func Run(ctx context.Context, cfg config.Config, in io.Reader, out io.Writer) (c
 
 	if err := ensureModels(ctx, cfg, client, in, out); err != nil {
 		return cfg, err
+	}
+
+	// Web search owns its own SearXNG container. This only does work when
+	// web.enabled is true; on any failure it reports and disables web search
+	// for the session rather than blocking AI Shell's other functionality.
+	if cfg.Web.Enabled {
+		webCfg, webOK := searxng.Ensure(ctx, cfg.Web, out)
+		cfg.Web = webCfg
+		if !webOK {
+			cfg.Web.Enabled = false
+		}
 	}
 
 	_ = writeCache()
@@ -311,10 +323,6 @@ func runWizard(in io.Reader, out io.Writer, cfg config.Config) (config.Config, e
 	updated.Ollama.Models = models
 
 	updated.Web.Enabled = promptBool(in, out, "Enable web search (SearXNG)? ", true)
-	if updated.Web.Enabled {
-		updated.Web.SearxngURL = promptLine(in, out,
-			fmt.Sprintf("SearXNG URL [%s]: ", cfg.Web.SearxngURL), cfg.Web.SearxngURL)
-	}
 	updated.Execution.Enabled = promptBool(in, out, "Enable command execution? ", false)
 
 	fmt.Fprintln(out)

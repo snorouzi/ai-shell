@@ -10,6 +10,8 @@ const (
 	RequestExecuteConfirm = "execute_confirm"
 
 	ResponseChunk       = "chunk"
+	ResponseSearching   = "searching"
+	ResponseNotice      = "notice"
 	ResponseDone        = "done"
 	ResponseError       = "error"
 	ResponseModel       = "model"

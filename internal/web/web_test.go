@@ -6,15 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"ai-shell/internal/config"
 )
-
-func TestNewRequiresURL(t *testing.T) {
-	if _, err := New(config.WebConfig{Enabled: true}); err == nil {
-		t.Fatal("expected error when searxng_url is empty")
-	}
-}
 
 func TestSearchParsesResults(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -26,10 +18,7 @@ func TestSearchParsesResults(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client, err := New(config.WebConfig{SearxngURL: srv.URL})
-	if err != nil {
-		t.Fatal(err)
-	}
+	client := newClient(srv.URL)
 
 	results, err := client.Search(context.Background(), "golang news")
 	if err != nil {
@@ -49,7 +38,7 @@ func TestSearchErrorOnNon200(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client, _ := New(config.WebConfig{SearxngURL: srv.URL})
+	client := newClient(srv.URL)
 	if _, err := client.Search(context.Background(), "x"); err == nil {
 		t.Fatal("expected error on non-200")
 	}

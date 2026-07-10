@@ -19,6 +19,7 @@ import (
 	shellcontext "ai-shell/internal/context"
 	"ai-shell/internal/daemon"
 	"ai-shell/internal/execution"
+	"ai-shell/internal/markdown"
 )
 
 const sessionEnv = "AI_SHELL_SESSION_ID"
@@ -151,12 +152,17 @@ func sendCommand(conn net.Conn, cfg config.Config, sessionID string, cmd command
 
 	var spinner *thinkingSpinner
 	if cmd.kind == "query" {
-		spinner = newThinkingSpinner(stderr)
+		spinner = newThinkingSpinner(stderr, "Thinking...")
 		spinner.Start()
 		defer spinner.Stop()
 	}
 
 	decoder := json.NewDecoder(bufio.NewReader(conn))
+	qr := &queryRenderer{
+		w:       stdout,
+		enabled: cfg.UI.RenderMarkdown,
+		tty:     isTerminal(stdout),
+	}
 	for {
 		var resp daemon.Response
 		if err := decoder.Decode(&resp); err != nil {
@@ -166,11 +172,30 @@ func sendCommand(conn net.Conn, cfg config.Config, sessionID string, cmd command
 			return err
 		}
 
+		if resp.Type == daemon.ResponseSearching {
+			if spinner != nil {
+				spinner.Stop()
+			}
+			spinner = newThinkingSpinner(stderr, "Searching...")
+			spinner.Start()
+			continue
+		}
+
+		if resp.Type == daemon.ResponseNotice {
+			// Non-fatal informational line (e.g. web search unavailable).
+			// Keep the flow going; the real answer follows.
+			if spinner != nil {
+				spinner.Stop()
+			}
+			fmt.Fprintln(stderr, resp.Content)
+			continue
+		}
+
 		if spinner != nil && resp.Type != daemon.ResponseChunk {
 			spinner.Stop()
 		}
 
-		done, err := handleResponse(conn, cfg, sessionID, stdout, resp, spinner)
+		done, err := handleResponse(conn, cfg, sessionID, stdout, resp, spinner, qr)
 		if err != nil {
 			return err
 		}
@@ -206,21 +231,27 @@ func requestForCommand(sessionID string, cmd command) daemon.Request {
 	}
 }
 
-func handleResponse(conn net.Conn, cfg config.Config, sessionID string, stdout io.Writer, resp daemon.Response, spinner *thinkingSpinner) (bool, error) {
+func handleResponse(conn net.Conn, cfg config.Config, sessionID string, stdout io.Writer, resp daemon.Response, spinner *thinkingSpinner, qr *queryRenderer) (bool, error) {
 	switch resp.Type {
 	case daemon.ResponseChunk:
 		if spinner != nil {
 			spinner.Stop()
 		}
+		qr.append(resp.Content)
 		_, err := fmt.Fprint(stdout, resp.Content)
 		return false, err
 	case daemon.ResponseDone:
+		qr.finish()
 		_, err := fmt.Fprintln(stdout)
 		return true, err
 	case daemon.ResponseError:
 		return true, errors.New(resp.Error)
 	case daemon.ResponseSuggestion:
-		return true, handleSuggestion(conn, cfg, sessionID, stdout, resp)
+		err := handleSuggestion(conn, cfg, sessionID, stdout, resp)
+		if cfg.Execution.Enabled {
+			return false, err
+		}
+		return true, err
 	case daemon.ResponseModelSwitch:
 		_, err := fmt.Fprintf(stdout, "current model: %s\n", resp.CurrentModel)
 		return true, err
@@ -238,13 +269,28 @@ func handleResponse(conn net.Conn, cfg config.Config, sessionID string, stdout i
 // enabled, asks the user to confirm before sending execute_confirm back to the
 // daemon. With execution disabled it only displays the suggestion.
 func handleSuggestion(conn net.Conn, cfg config.Config, sessionID string, stdout io.Writer, resp daemon.Response) error {
-	if resp.Explanation != "" {
-		fmt.Fprintln(stdout, resp.Explanation)
+	explanation := strings.TrimSpace(resp.Explanation)
+	if explanation != "" {
+		fmt.Fprintln(stdout, explanation)
+		fmt.Fprintln(stdout)
 	}
-	for i, cmd := range resp.Commands {
-		fmt.Fprintf(stdout, "  %d. %s\n", i+1, cmd)
+
+	if len(resp.Commands) > 0 {
+		label := "Suggested command"
+		if len(resp.Commands) > 1 {
+			label = "Suggested commands"
+		}
+		fmt.Fprintf(stdout, "%s:\n", label)
+		for i, cmd := range resp.Commands {
+			fmt.Fprintf(stdout, "  %d. %s\n", i+1, cmd)
+		}
+		if resp.Risk != "" {
+			fmt.Fprintln(stdout)
+			fmt.Fprintf(stdout, "Risk: %s\n", resp.Risk)
+		}
+	} else if resp.Risk != "" {
+		fmt.Fprintf(stdout, "Risk: %s\n", resp.Risk)
 	}
-	fmt.Fprintf(stdout, "Risk: %s\n", resp.Risk)
 
 	if !cfg.Execution.Enabled {
 		return nil
@@ -293,17 +339,70 @@ func sessionID() string {
 
 type thinkingSpinner struct {
 	w      io.Writer
+	label  string
 	done   chan struct{}
 	once   sync.Once
 	mu     sync.Mutex
 	active bool
 }
 
-func newThinkingSpinner(w io.Writer) *thinkingSpinner {
+func newThinkingSpinner(w io.Writer, label string) *thinkingSpinner {
 	return &thinkingSpinner{
-		w:    w,
-		done: make(chan struct{}),
+		w:     w,
+		label: label,
+		done:  make(chan struct{}),
 	}
+}
+
+// queryRenderer captures a streamed answer so it can be re-rendered as Markdown
+// once complete. While chunks arrive it prints them verbatim to stdout (so the
+// user still sees live output), but on finish it jumps back to the start of the
+// answer, clears the plain text, and replaces it with styled Markdown — but
+// only when rendering is enabled, stdout is a terminal, and the content looks
+// like Markdown.
+type queryRenderer struct {
+	w           io.Writer
+	enabled     bool
+	tty         bool
+	buffer      strings.Builder
+	cursorSaved bool
+}
+
+func (q *queryRenderer) append(s string) {
+	if q.enabled && q.tty && !q.cursorSaved {
+		fmt.Fprint(q.w, "\033[s")
+		q.cursorSaved = true
+	}
+	q.buffer.WriteString(s)
+}
+
+func (q *queryRenderer) finish() {
+	if !(q.enabled && q.tty) {
+		return
+	}
+	if q.buffer.Len() == 0 {
+		return
+	}
+	if !markdown.LooksLikeMarkdown(q.buffer.String()) {
+		return
+	}
+	fmt.Fprint(q.w, "\033[u\033[J")
+	markdown.Render(q.w, q.buffer.String())
+}
+
+// isTerminal reports whether w is an interactive character device (a TTY).
+// When stdout is piped to a file or pager we must leave the raw Markdown
+// untouched rather than emitting ANSI escapes.
+func isTerminal(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
 }
 
 func (s *thinkingSpinner) Start() {
@@ -321,12 +420,12 @@ func (s *thinkingSpinner) Start() {
 		defer ticker.Stop()
 
 		i := 0
-		fmt.Fprintf(s.w, "\r\033[2mThinking... %s\033[0m", frames[i])
+		fmt.Fprintf(s.w, "\r\033[2m%s %s\033[0m", s.label, frames[i])
 		for {
 			select {
 			case <-ticker.C:
 				i = (i + 1) % len(frames)
-				fmt.Fprintf(s.w, "\r\033[2mThinking... %s\033[0m", frames[i])
+				fmt.Fprintf(s.w, "\r\033[2m%s %s\033[0m", s.label, frames[i])
 			case <-s.done:
 				return
 			}

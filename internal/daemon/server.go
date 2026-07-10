@@ -155,24 +155,91 @@ func (s *Server) handleQuery(ctx context.Context, w io.Writer, req Request) {
 		return
 	}
 
-	if s.cfg.Execution.Enabled {
-		s.handleExecQuery(ctx, w, req, model)
+	// Optional live context. When web search is enabled this runs the model's
+	// "do I need current information?" decision and, if so, queries SearXNG.
+	// The returned context composes with both chat and execution below, so the
+	// two features are no longer mutually exclusive.
+	webContext, err := s.maybeWebSearch(ctx, w, req, model)
+	if err != nil {
 		return
 	}
 
-	if s.cfg.Web.Enabled && s.web != nil {
-		s.handleWebQuery(ctx, w, req, model)
+	if s.cfg.Execution.Enabled {
+		s.handleExecQuery(ctx, w, req, model, webContext)
 		return
+	}
+
+	s.handleChatQuery(ctx, w, req, model, webContext)
+}
+
+// maybeWebSearch runs the web-search decision loop. It returns formatted search
+// results to fold into the final answer, or "" when the model does not need
+// live information. A non-nil error means a fatal condition was already written
+// to the connection (search failure), and the caller should stop.
+func (s *Server) maybeWebSearch(ctx context.Context, w io.Writer, req Request, model string) (string, error) {
+	if !s.cfg.Web.Enabled || s.web == nil {
+		return "", nil
 	}
 
 	requestContext := shellcontext.Enrich(ctx, s.cfg.Context, req.Context)
-	systemPrompt := shellcontext.SystemPrompt(s.cfg.Context, requestContext)
+	system := shellcontext.SystemPrompt(s.cfg.Context, requestContext)
+	if system != "" {
+		system += "\n\n"
+	}
+	system += webToolInstruction
+
+	// Turn 1: let the model decide whether to call the web_search tool.
+	var first strings.Builder
+	err := s.ollama.Generate(ctx, ollama.GenerateRequest{
+		Model:  model,
+		Prompt: s.promptWithHistory(req.SessionID, req.Prompt),
+		System: system,
+	}, func(chunk ollama.GenerateChunk) error {
+		first.WriteString(chunk.Response)
+		return nil
+	})
+	if err != nil {
+		writeResponse(w, Response{Type: ResponseError, Error: err.Error()})
+		return "", err
+	}
+
+	query, wantsSearch := web.ParseToolCall(first.String())
+	if !wantsSearch {
+		return "", nil
+	}
+
+	// Signal the client so it can show a "searching" indicator during the
+	// (potentially slow) network round-trip to SearXNG.
+	writeResponse(w, Response{Type: ResponseSearching})
+
+	results, serr := s.web.Search(ctx, query)
+	if serr != nil {
+		// Web search is optional: don't abort the whole query on failure.
+		// Tell the client what happened and fall back to answering without
+		// live context.
+		writeResponse(w, Response{Type: ResponseNotice, Content: "web search unavailable: " + serr.Error()})
+		return "", nil
+	}
+
+	return web.Format(results), nil
+}
+
+// handleChatQuery streams a plain-text answer, optionally informed by web
+// search results when web search was used.
+func (s *Server) handleChatQuery(ctx context.Context, w io.Writer, req Request, model, webContext string) {
+	requestContext := shellcontext.Enrich(ctx, s.cfg.Context, req.Context)
+	system := shellcontext.SystemPrompt(s.cfg.Context, requestContext)
 	prompt := s.promptWithHistory(req.SessionID, req.Prompt)
+	if webContext != "" {
+		prompt += "\n\n" + webContext +
+			"\n\nAnswer the user's question using the search results above."
+	}
+
 	var assistant strings.Builder
-	err = s.ollama.Generate(ctx, ollama.GenerateRequest{
+	err := s.ollama.Generate(ctx, ollama.GenerateRequest{
 		Model:  model,
 		Prompt: prompt,
-		System: systemPrompt,
+		System: system,
 	}, func(chunk ollama.GenerateChunk) error {
 		if chunk.Response == "" {
 			return nil
@@ -195,14 +262,19 @@ func (s *Server) handleQuery(ctx context.Context, w io.Writer, req Request) {
 // handleExecQuery asks the model for a structured command suggestion (JSON),
 // classifies its risk from the config rules, and returns it as a suggestion the
 // client can confirm. Plain-text or command-less answers fall back to a normal
-// response so execution never breaks ordinary chat.
-func (s *Server) handleExecQuery(ctx context.Context, w io.Writer, req Request, model string) {
+// response so execution never breaks ordinary chat. When webContext is non-empty
+// the model is also told to use the live search results it contains.
+func (s *Server) handleExecQuery(ctx context.Context, w io.Writer, req Request, model, webContext string) {
 	requestContext := shellcontext.Enrich(ctx, s.cfg.Context, req.Context)
 	system := shellcontext.SystemPrompt(s.cfg.Context, requestContext)
 	if system != "" {
 		system += "\n\n"
 	}
 	system += execution.SystemPrompt()
+	if webContext != "" {
+		system += "\n\n" + webContext +
+			"\n\nUse the search results above when they are relevant to the command."
+	}
 
 	var raw strings.Builder
 	err := s.ollama.Generate(ctx, ollama.GenerateRequest{
@@ -241,6 +313,36 @@ func (s *Server) handleExecQuery(ctx context.Context, w io.Writer, req Request, 
 		Commands:    sug.Commands,
 		Risk:        sug.Risk,
 	})
+
+	nc, ok := w.(net.Conn)
+	if !ok {
+		writeResponse(w, Response{Type: ResponseError, Error: "internal error: connection does not support reading"})
+		return
+	}
+
+	var confirmReq Request
+	if err := json.NewDecoder(bufio.NewReader(nc)).Decode(&confirmReq); err != nil {
+		writeResponse(w, Response{Type: ResponseError, Error: err.Error()})
+		return
+	}
+
+	s.sessions.ClearPendingSuggestion(req.SessionID)
+
+	if confirmReq.Type != RequestExecuteConfirm || !confirmReq.Approve {
+		writeResponse(w, Response{Type: ResponseDone})
+		return
+	}
+
+	var b strings.Builder
+	for _, cmd := range sug.Commands {
+		out, err := execution.Execute(ctx, cmd, sug.Risk, s.cfg.Execution)
+		fmt.Fprintf(&b, "$ %s\n%s", cmd, out)
+		if err != nil {
+			fmt.Fprintf(&b, "error: %v\n", err)
+		}
+	}
+	writeResponse(w, Response{Type: ResponseChunk, Content: b.String()})
+	writeResponse(w, Response{Type: ResponseDone})
 }
 
 // handleExecuteConfirm runs the pending suggestion once the client confirms.
@@ -269,76 +371,6 @@ func (s *Server) handleExecuteConfirm(ctx context.Context, w io.Writer, req Requ
 	}
 	writeResponse(w, Response{Type: ResponseChunk, Content: b.String()})
 	writeResponse(w, Response{Type: ResponseDone})
-}
-
-// handleWebQuery runs a basic function-calling loop: it asks the model whether
-// the question needs current information, and if so calls SearXNG and folds the
-// results into a second, final generation. When the model answers directly, the
-// first response is streamed as-is.
-func (s *Server) handleWebQuery(ctx context.Context, w io.Writer, req Request, model string) {
-	requestContext := shellcontext.Enrich(ctx, s.cfg.Context, req.Context)
-	system := shellcontext.SystemPrompt(s.cfg.Context, requestContext)
-	if system != "" {
-		system += "\n\n"
-	}
-	system += webToolInstruction
-
-	// Turn 1: let the model decide whether to call the web_search tool.
-	var first strings.Builder
-	err := s.ollama.Generate(ctx, ollama.GenerateRequest{
-		Model:  model,
-		Prompt: s.promptWithHistory(req.SessionID, req.Prompt),
-		System: system,
-	}, func(chunk ollama.GenerateChunk) error {
-		first.WriteString(chunk.Response)
-		return nil
-	})
-	if err != nil {
-		writeResponse(w, Response{Type: ResponseError, Error: err.Error()})
-		return
-	}
-
-	query, wantsSearch := web.ParseToolCall(first.String())
-	if !wantsSearch || s.web == nil {
-		writeResponse(w, Response{Type: ResponseChunk, Content: first.String()})
-		writeResponse(w, Response{Type: ResponseDone})
-		s.sessions.AddMessages(req.SessionID,
-			session.Message{Role: "user", Content: req.Prompt},
-			session.Message{Role: "assistant", Content: first.String()},
-		)
-		return
-	}
-
-	results, serr := s.web.Search(ctx, query)
-	if serr != nil {
-		writeResponse(w, Response{Type: ResponseError, Error: "web search failed: " + serr.Error()})
-		return
-	}
-
-	// Turn 2: fold the search results into context and generate the final answer.
-	finalPrompt := fmt.Sprintf(
-		"Original question: %s\n\n%s\n\nAnswer the original question using the search results above.",
-		req.Prompt, web.Format(results))
-	var final strings.Builder
-	err = s.ollama.Generate(ctx, ollama.GenerateRequest{
-		Model:  model,
-		Prompt: finalPrompt,
-	}, func(chunk ollama.GenerateChunk) error {
-		if chunk.Response == "" {
-			return nil
-		}
-		final.WriteString(chunk.Response)
-		return writeResponse(w, Response{Type: ResponseChunk, Content: chunk.Response})
-	})
-	if err != nil {
-		writeResponse(w, Response{Type: ResponseError, Error: err.Error()})
-		return
-	}
-	writeResponse(w, Response{Type: ResponseDone})
-	s.sessions.AddMessages(req.SessionID,
-		session.Message{Role: "user", Content: req.Prompt},
-		session.Message{Role: "assistant", Content: final.String()},
-	)
 }
 
 func parseSuggestion(raw string) (execution.Suggestion, error) {

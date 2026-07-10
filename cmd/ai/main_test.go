@@ -98,7 +98,7 @@ func TestHandleModelListResponse(t *testing.T) {
 		Profiles: []daemon.ModelProfile{
 			{Profile: "general", Model: "qwen3:8b", Installed: true},
 		},
-	}, nil)
+	}, nil, &queryRenderer{})
 	if err != nil {
 		t.Fatalf("handleResponse returned error: %v", err)
 	}
@@ -115,13 +115,13 @@ func TestHandleModelListResponse(t *testing.T) {
 func TestHandleChunkStopsSpinner(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	spinner := newThinkingSpinner(&stderr)
+	spinner := newThinkingSpinner(&stderr, "Thinking...")
 	spinner.Start()
 
 	done, err := handleResponse(nil, config.Config{}, "", &stdout, daemon.Response{
 		Type:    daemon.ResponseChunk,
 		Content: "OK",
-	}, spinner)
+	}, spinner, &queryRenderer{})
 	if err != nil {
 		t.Fatalf("handleResponse returned error: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestHandleChunkStopsSpinner(t *testing.T) {
 		t.Fatal("done = true")
 	}
 	if stdout.String() != "OK" {
-		t.Fatalf("stdout = %q", stdout.String())
+		t.Fatalf("stdout = %q, want %q", stdout.String(), "OK")
 	}
 	if !bytes.Contains(stderr.Bytes(), []byte("\033[2K")) {
 		t.Fatalf("stderr did not contain clear-line escape: %q", stderr.String())

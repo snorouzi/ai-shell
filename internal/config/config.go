@@ -28,6 +28,7 @@ type Config struct {
 	Context   ContextConfig   `yaml:"context"`
 	Execution ExecutionConfig `yaml:"execution"`
 	Web       WebConfig       `yaml:"web"`
+	UI        UIConfig        `yaml:"ui"`
 
 	path string `yaml:"-"`
 }
@@ -77,9 +78,13 @@ type RiskRules struct {
 }
 
 type WebConfig struct {
-	Enabled    bool   `yaml:"enabled"`
-	Provider   string `yaml:"provider"`
-	SearxngURL string `yaml:"searxng_url"`
+	Enabled     bool `yaml:"enabled"`
+	Provider    string `yaml:"provider"`
+	SearxngPort int  `yaml:"searxng_port"`
+}
+
+type UIConfig struct {
+	RenderMarkdown bool `yaml:"render_markdown"`
 }
 
 // Default returns the shipped configuration from the implementation spec.
@@ -138,7 +143,10 @@ func Default() Config {
 		Web: WebConfig{
 			Enabled:    true,
 			Provider:   "searxng",
-			SearxngURL: "http://localhost:8080",
+			SearxngPort: 8081,
+		},
+		UI: UIConfig{
+			RenderMarkdown: true,
 		},
 	}
 }
