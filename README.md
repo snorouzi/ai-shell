@@ -20,7 +20,7 @@ connection, the per-session chat memory, and (optionally) the SearXNG container.
 Subsequent calls in the same shell reuse that daemon over a Unix socket, so
 responses stream back as they are generated and conversation context is kept.
 
-- **Source:** https://github.com/saeedNW/ai-shell
+- **Source:** https://github.com/snorouzi/ai-shell
 
 ---
 
@@ -90,7 +90,7 @@ are chosen to fit a ~6 GB VRAM budget.
 Clone the repository and build from the project root:
 
 ```bash
-git clone https://github.com/saeedNW/ai-shell.git
+git clone https://github.com/snrouzi/ai-shell.git
 cd ai-shell
 go build -o ~/go/bin/ai ./cmd/ai
 ```
